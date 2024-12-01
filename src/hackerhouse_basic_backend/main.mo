@@ -5,32 +5,98 @@ import Array "mo:base/Array";
 import Blob "mo:base/Blob";
 import Text "mo:base/Text";
 import Cycles "mo:base/ExperimentalCycles";
+import Debug "mo:base/Debug";
+import Map "mo:map/Map";
+import Principal "mo:base/Principal";
+import Nat "mo:base/Nat";
+import Float "mo:base/Float";
+import { phash; nhash} "mo:map/Map";
+import Vector "mo:vector";
+import { JSON } "mo:serde";
 
 actor {
+    stable var autoIndex = 0;
+    let userIdMap = Map.new<Principal, Nat>();
+    let userProfileMap = Map.new<Nat, Text>();
+    let userResultsMap = Map.new<Nat, Vector.Vector<Text>>();
+
     public query ({ caller }) func getUserProfile() : async Result.Result<{ id : Nat; name : Text }, Text> {
+        Debug.print("Principal: " # debug_show caller);
         return #ok({ id = 123; name = "test" });
     };
 
     public shared ({ caller }) func setUserProfile(name : Text) : async Result.Result<{ id : Nat; name : Text }, Text> {
-        return #ok({ id = 123; name = "test" });
+        // Check if the user is already registered
+        switch (Map.get(userIdMap, phash, caller)) {
+            case (?caller) {};
+            case (_) {
+                // Set the new user Id
+                Map.set(userIdMap, phash, caller, autoIndex);
+
+                // Set the new user profile name
+                Map.set(userProfileMap, nhash, autoIndex, name);
+
+                // Increment the autoIndex
+                autoIndex += 1;
+            };
+        };
+
+        // Search for existing user ID
+        let foundId = switch( Map.get(userIdMap, phash, caller)){
+            case (?id) id;
+            case (_) { return #err ("User ID not found") };
+        };
+
+        // Set the existing user profile name
+        Map.set(userProfileMap, nhash, foundId, name);
+
+        return #ok({ id = foundId; name = name });
     };
 
     public shared ({ caller }) func addUserResult(result : Text) : async Result.Result<{ id : Nat; results : [Text] }, Text> {
-        return #ok({ id = 123; results = ["fake result"] });
+        // Check if the user is already registered
+        let userId = switch (Map.get(userIdMap, phash, caller)) {
+            case (?caller) caller;
+            case (_) { return #err ("User not found") };
+        };
+
+        // Check if the user has results
+        let userResults = switch (Map.get(userResultsMap, nhash, userId)) {
+            case (?results) results;
+            case (_) { Vector.new<Text>() };
+        };
+
+        // Add the new result
+        Vector.add(userResults, result);
+        Map.set(userResultsMap, nhash, userId, userResults);
+
+        return #ok({ id = userId; results = Vector.toArray(userResults) });
     };
 
     public query ({ caller }) func getUserResults() : async Result.Result<{ id : Nat; results : [Text] }, Text> {
-        return #ok({ id = 123; results = ["fake result"] });
+        // Check if the user is already registered
+        let userId = switch (Map.get(userIdMap, phash, caller)) {
+            case (?caller) caller;
+            case (_) { return #err ("User not found") };
+        };
+
+        // Check if the user has results
+        let userResults = switch (Map.get(userResultsMap, nhash, userId)) {
+            case (?results) results;
+            case (_) { return #err ("User Results not found") };
+        };
+
+        return #ok({ id = userId; results = Vector.toArray(userResults) });
     };
 
-    public func outcall_ai_model_for_sentiment_analysis(paragraph : Text) : async Result.Result<{ paragraph : Text; result : Text }, Text> {
+    public func outcall_ai_model_for_sentiment_analysis(paragraph : Text) : async Result.Result<{ paragraph : Text; result : Text; confidence : Float }, Text> {
         let host = "api-inference.huggingface.co";
         let path = "/models/cardiffnlp/twitter-roberta-base-sentiment-latest";
 
         let headers = [
             {
                 name = "Authorization";
-                value = "Bearer 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";
+                value = "Bearer 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";
             },
             { name = "Content-Type"; value = "application/json" },
         ];
@@ -41,11 +107,23 @@ actor {
 
         // TODO
         // Install "serde" package and parse JSON
-        // calculate highest sentiment and return it as a result
+        let blob = switch (JSON.fromText(text_response, null)) {
+            case (#ok(b)) {b};
+            case (_) { return #err("Failed to parse JSON" # text_response) };
+        };
 
+        let results: ?[[{label_ : Text; score: Float}]] = from_candid(blob);
+
+        let parsed_results = switch (results) {
+            case (?r) { r[0]};
+            case (_) { return #err("Failed to parse JSON" # text_response) };
+        };
+
+        // Return result
         return #ok({
             paragraph = paragraph;
-            result = text_response;
+            result = parsed_results[0].label_;
+            confidence = parsed_results[0].score;
         });
     };
 
@@ -110,7 +188,7 @@ actor {
         let http_request : Types.HttpRequestArgs = {
             url = url;
             max_response_bytes = null; //optional for request
-            headers = request_headers;
+            headers = merged_headers;
             // note: type of `body` is ?[Nat8] so it is passed here as "?request_body_as_nat8" instead of "request_body_as_nat8"
             body = ?request_body_as_nat8;
             method = #post;
